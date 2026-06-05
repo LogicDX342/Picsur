@@ -1,25 +1,30 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { fileTypeFromBuffer, FileTypeResult } from 'file-type';
+import isSvg from 'is-svg';
 import { ImageRequestParams } from 'picsur-shared/dist/dto/api/image.dto';
 import { ImageEntryVariant } from 'picsur-shared/dist/dto/image-entry-variant.enum';
 import {
-    AnimFileType,
-    FileType,
-    ImageFileType,
-    Mime2FileType,
+  AnimFileType,
+  FileType,
+  ImageFileType,
+  Mime2FileType,
 } from 'picsur-shared/dist/dto/mimes.dto';
 import { SysPreference } from 'picsur-shared/dist/dto/sys-preferences.enum';
 import { UsrPreference } from 'picsur-shared/dist/dto/usr-preferences.enum';
 import {
-    AsyncFailable,
-    Fail,
-    FT,
-    HasFailed,
+  AsyncFailable,
+  Fail,
+  Failable,
+  FT,
+  HasFailed,
 } from 'picsur-shared/dist/types/failable';
 import { FindResult } from 'picsur-shared/dist/types/find-result';
-import { ParseFileType } from 'picsur-shared/dist/util/parse-mime';
+import {
+  ParseFileType,
+} from 'picsur-shared/dist/util/parse-mime';
 import { IsQOI } from 'qoi-img';
+import { optimize } from 'svgo';
 import { ImageDBService } from '../../collections/image-db/image-db.service.js';
 import { ImageFileDBService } from '../../collections/image-db/image-file-db.service.js';
 import { SysPreferenceDbService } from '../../collections/preference-db/sys-preference-db.service.js';
@@ -93,6 +98,14 @@ export class ImageManagerService {
     const fileType = await this.getFileTypeFromBuffer(image);
     if (HasFailed(fileType)) return fileType;
 
+    let uploadImage = image;
+    if (fileType.identifier === ImageFileType.SVG) {
+      const optimizeResult = this.optimizeSvg(image);
+      if (HasFailed(optimizeResult)) return optimizeResult;
+
+      uploadImage = optimizeResult;
+    }
+
     // Check if need to save orignal
     const keepOriginal = await this.userPref.getBooleanPreference(
       userid,
@@ -101,7 +114,10 @@ export class ImageManagerService {
     if (HasFailed(keepOriginal)) return keepOriginal;
 
     // Process
-    const processResult = await this.processService.process(image, fileType);
+    const processResult = await this.processService.process(
+      uploadImage,
+      fileType,
+    );
     if (HasFailed(processResult)) return processResult;
 
     // Strip extension from filename
@@ -131,7 +147,7 @@ export class ImageManagerService {
       const originalFileEntity = await this.imageFilesService.setFile(
         imageEntity.id,
         ImageEntryVariant.ORIGINAL,
-        image,
+        uploadImage,
         fileType.identifier,
       );
       if (HasFailed(originalFileEntity)) return originalFileEntity;
@@ -145,6 +161,22 @@ export class ImageManagerService {
     fileType: string,
     options: ImageRequestParams,
   ): AsyncFailable<EImageDerivativeBackend> {
+    if (fileType === ImageFileType.SVG) {
+      const masterImage = await this.getMaster(imageId);
+      if (HasFailed(masterImage)) return masterImage;
+
+      if (masterImage.filetype === ImageFileType.SVG) {
+        const derivative = new EImageDerivativeBackend();
+        derivative.image_id = masterImage.image_id;
+        derivative.key = '';
+        derivative.filetype = masterImage.filetype;
+        derivative.last_read = new Date();
+        derivative.data = masterImage.data;
+        return derivative;
+      }
+      return Fail(FT.UsrValidation, 'Cannot convert non-SVG image to SVG');
+    }
+
     const targetFileType = ParseFileType(fileType);
     if (HasFailed(targetFileType)) return targetFileType;
 
@@ -248,8 +280,15 @@ export class ImageManagerService {
     let mime: string | undefined;
     if (filetypeResult === undefined) {
       if (IsQOI(image)) mime = 'image/x-qoi';
+      else if (isSvg(image.toString('utf8'))) mime = 'image/svg+xml';
     } else {
       mime = filetypeResult.mime;
+      if (
+        (mime === 'application/xml' || mime === 'text/xml') &&
+        isSvg(image.toString('utf8'))
+      ) {
+        mime = 'image/svg+xml';
+      }
     }
 
     if (mime === undefined) mime = 'other/unknown';
@@ -267,6 +306,20 @@ export class ImageManagerService {
     }
 
     return ParseFileType(filetype);
+  }
+
+  private optimizeSvg(image: Buffer): Failable<Buffer> {
+    try {
+      const result = optimize(image.toString('utf8'), {
+        multipass: true,
+        plugins: ['preset-default', 'removeScripts'],
+      });
+
+      return Buffer.from(result.data, 'utf8');
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return Fail(FT.UsrValidation, 'Invalid SVG file', reason);
+    }
   }
 
   private getConvertHash(options: object) {
