@@ -23,6 +23,18 @@ import { Permission } from '../../models/constants/permissions.const.js';
 import { EUserBackend2EUser } from '../../models/transformers/user.transformer.js';
 import { BrandMessageType, GetBrandMessage } from '../../util/branding.js';
 
+const SvgContentSecurityPolicy = [
+  'sandbox',
+  "default-src 'none'",
+  "base-uri 'none'",
+  "child-src 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "frame-src 'none'",
+  "object-src 'none'",
+  "script-src 'none'",
+].join('; ');
+
 // This is the only controller with CORS enabled
 @Controller('i')
 @RequiredPermissions(Permission.ImageView)
@@ -45,10 +57,12 @@ export class ImageController {
         await this.getOriginalDownloadFileType(fullid.id),
       );
 
+      this.setImageResponseHeaders(res, filetype.identifier);
       res.type(ThrowIfFailed(FileType2Mime(filetype.identifier)));
       return;
     }
 
+    this.setImageResponseHeaders(res, fullid.filetype);
     res.type(ThrowIfFailed(FileType2Mime(fullid.filetype)));
   }
 
@@ -64,6 +78,7 @@ export class ImageController {
       if (fullid.variant === ImageEntryVariant.ORIGINAL) {
         const image = ThrowIfFailed(await this.getOriginalDownload(fullid.id));
 
+        this.setImageResponseHeaders(res, image.filetype);
         res.type(ThrowIfFailed(FileType2Mime(image.filetype)));
         return image.data;
       }
@@ -76,6 +91,7 @@ export class ImageController {
         ),
       );
 
+      this.setImageResponseHeaders(res, image.filetype);
       res.type(ThrowIfFailed(FileType2Mime(image.filetype)));
       return image.data;
     } catch (e) {
@@ -103,6 +119,13 @@ export class ImageController {
     const imageUser = ThrowIfFailed(imageUserRes);
 
     return { image, user: EUserBackend2EUser(imageUser), fileTypes };
+  }
+
+  private setImageResponseHeaders(res: FastifyReply, filetype: string) {
+    if (filetype !== ImageFileType.SVG) return;
+
+    res.header('Content-Security-Policy', SvgContentSecurityPolicy);
+    res.header('X-Content-Type-Options', 'nosniff');
   }
 
   private async getOriginalDownload(imageId: string) {

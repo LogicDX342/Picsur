@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { createHash } from 'crypto';
+import createDOMPurify from 'dompurify';
 import { fileTypeFromBuffer, FileTypeResult } from 'file-type';
 import isSvg from 'is-svg';
+import { JSDOM } from 'jsdom';
 import { ImageRequestParams } from 'picsur-shared/dist/dto/api/image.dto';
 import { ImageEntryVariant } from 'picsur-shared/dist/dto/image-entry-variant.enum';
 import {
@@ -20,9 +22,7 @@ import {
   HasFailed,
 } from 'picsur-shared/dist/types/failable';
 import { FindResult } from 'picsur-shared/dist/types/find-result';
-import {
-  ParseFileType,
-} from 'picsur-shared/dist/util/parse-mime';
+import { ParseFileType } from 'picsur-shared/dist/util/parse-mime';
 import { IsQOI } from 'qoi-img';
 import { optimize } from 'svgo';
 import { ImageDBService } from '../../collections/image-db/image-db.service.js';
@@ -36,6 +36,20 @@ import { MutexFallBack } from '../../util/mutex-fallback.js';
 import { ImageConverterService } from './image-converter.service.js';
 import { ImageProcessorService } from './image-processor.service.js';
 import { WebPInfo } from './webpinfo/webpinfo.js';
+const SvgDOMPurify = createDOMPurify(new JSDOM('').window);
+
+SvgDOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  if (node.tagName && node.tagName.toLowerCase() === 'use') {
+    const xlinkHref = node.getAttribute('xlink:href');
+    if (xlinkHref && !xlinkHref.startsWith('#')) {
+      node.removeAttribute('xlink:href');
+    }
+    const href = node.getAttribute('href');
+    if (href && !href.startsWith('#')) {
+      node.removeAttribute('href');
+    }
+  }
+});
 
 @Injectable()
 export class ImageManagerService {
@@ -315,7 +329,23 @@ export class ImageManagerService {
         plugins: ['preset-default', 'removeScripts'],
       });
 
-      return Buffer.from(result.data, 'utf8');
+      const sanitized = SvgDOMPurify.sanitize(result.data, {
+        USE_PROFILES: { svg: true, svgFilters: true },
+        FORBID_TAGS: ['foreignObject', 'script', 'iframe', 'object', 'embed'],
+        ADD_TAGS: ['use'],
+        ADD_ATTR: ['xlink:href', 'href'],
+        RETURN_TRUSTED_TYPE: false,
+      });
+
+      if (!isSvg(sanitized)) {
+        return Fail(
+          FT.UsrValidation,
+          'Invalid SVG file',
+          'Sanitized SVG output is not valid SVG',
+        );
+      }
+
+      return Buffer.from(sanitized, 'utf8');
     } catch (error: unknown) {
       const reason = error instanceof Error ? error.message : String(error);
       return Fail(FT.UsrValidation, 'Invalid SVG file', reason);
